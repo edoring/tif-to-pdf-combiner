@@ -1,209 +1,231 @@
 from pathlib import Path
-from PIL import Image
-from tqdm import tqdm
 import re
 import sys
+import traceback
 from datetime import datetime
 
 
-def timestamp() -> str:
+def pause_before_exit():
+    input("\nPress Enter to close...")
+
+
+def timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def log(message: str, log_lines: list[str], also_print: bool = False) -> None:
-    line = f"[{timestamp()}] {message}"
-    log_lines.append(line)
-    if also_print:
-        print(message)
+def log(message, log_lines):
+    log_lines.append(f"[{timestamp()}] {message}")
 
 
-def extract_sequence_number(filename: str) -> int | None:
+def extract_sequence_number(filename):
     """
-    Extract trailing sequence number from filenames like:
-    file_001.tif
-    boxfolder_127.tiff
+    Finds the final number in the filename before the extension.
+
+    Works with:
+    KIC Image 0001.tif
+    KIC Image 0002.tiff
+    Petition for Referendum_0001.tif
+    scan-0001.tif
+    page0001.tif
+    0001.tif
     """
-    match = re.search(r"_(\d+)\.(tif|tiff)$", filename, re.IGNORECASE)
-    if match:
-        return int(match.group(1))
+    stem = Path(filename).stem
+    matches = re.findall(r"\d+", stem)
+
+    if matches:
+        return int(matches[-1])
+
     return None
 
 
-def find_tif_files(folder: Path) -> list[Path]:
-    return list(folder.glob("*.tif")) + list(folder.glob("*.tiff"))
-
-
-def validate_and_sort_files(files: list[Path], log_lines: list[str]) -> tuple[list[tuple[int, Path]], list[str]]:
-    numbered_files = []
-    skipped_files = []
-
-    for file in files:
-        seq = extract_sequence_number(file.name)
-        if seq is None:
-            skipped_files.append(file.name)
-            log(f"Skipped non-matching filename: {file.name}", log_lines)
-        else:
-            numbered_files.append((seq, file))
-
-    numbered_files.sort(key=lambda x: x[0])
-    return numbered_files, skipped_files
-
-
-def write_manifest(manifest_path: Path, numbered_files: list[tuple[int, Path]]) -> None:
-    with manifest_path.open("w", encoding="utf-8") as f:
-        f.write("sequence_number\tfilename\n")
-        for seq, path in numbered_files:
-            f.write(f"{seq:03d}\t{path.name}\n")
-
-
-def check_sequence(numbered_files: list[tuple[int, Path]]) -> tuple[int, int, list[int]]:
-    found_numbers = [seq for seq, _ in numbered_files]
-    min_seq = min(found_numbers)
-    max_seq = max(found_numbers)
-
-    expected_numbers = set(range(min_seq, max_seq + 1))
-    actual_numbers = set(found_numbers)
-    missing_numbers = sorted(expected_numbers - actual_numbers)
-
-    return min_seq, max_seq, missing_numbers
-
-
-def build_pdf(numbered_files: list[tuple[int, Path]], output_pdf: Path, log_lines: list[str]) -> int:
-    images = []
-
-    for seq, file_path in tqdm(
-        numbered_files,
-        desc="Building PDF",
-        unit="file",
-        ncols=90,
-        colour="green"
-    ):
-        try:
-            with Image.open(file_path) as img:
-                rgb_img = img.convert("RGB")
-                images.append(rgb_img.copy())
-                log(f"Included {seq:03d}: {file_path.name}", log_lines)
-        except Exception as e:
-            log(f"ERROR processing {file_path.name}: {e}", log_lines)
-
-    if not images:
-        return 0
-
-    first_image, remaining_images = images[0], images[1:]
-
-    # Explicitly tell Pillow the format is PDF
-    first_image.save(
-        output_pdf,
-        format="PDF",
-        save_all=True,
-        append_images=remaining_images
-    )
-
-    return len(images)
-
-
-def main() -> None:
-    print("\nTIFF to Single PDF Combiner")
+def main():
+    print("\nTIF to Single PDF Combiner")
     print("-" * 30)
 
-    input_folder_str = input("Input folder with TIFFs: ").strip().strip('"')
-    output_pdf_str = input("Output PDF path: ").strip().strip('"')
+    try:
+        from PIL import Image
+    except ModuleNotFoundError:
+        print("\nERROR: Pillow is not installed.")
+        print("Run this in PowerShell:")
+        print("python -m pip install pillow")
+        pause_before_exit()
+        sys.exit(1)
 
-    input_folder = Path(input_folder_str)
-    output_pdf = Path(output_pdf_str)
+    try:
+        from tqdm import tqdm
+    except ModuleNotFoundError:
+        print("\nERROR: tqdm is not installed.")
+        print("Run this in PowerShell:")
+        print("python -m pip install tqdm")
+        pause_before_exit()
+        sys.exit(1)
 
-    # Auto-add .pdf if omitted
+    input_folder = Path(input("\nInput folder with TIFs: ").strip().strip('"'))
+    output_pdf = Path(input("Output PDF path: ").strip().strip('"'))
+
     if output_pdf.suffix.lower() != ".pdf":
         output_pdf = output_pdf.with_suffix(".pdf")
 
-    if not input_folder.exists() or not input_folder.is_dir():
-        print("\nInput folder does not exist or is not a folder.")
+    if not input_folder.exists():
+        print("\nERROR: Input folder does not exist.")
+        print(f"You entered: {input_folder}")
+        pause_before_exit()
+        sys.exit(1)
+
+    if not input_folder.is_dir():
+        print("\nERROR: Input path is not a folder.")
+        print(f"You entered: {input_folder}")
+        pause_before_exit()
         sys.exit(1)
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
 
     log_file = output_pdf.with_suffix(".log.txt")
     manifest_file = output_pdf.with_suffix(".manifest.txt")
-    log_lines: list[str] = []
+    log_lines = []
 
     print("\nScanning files...")
 
-    raw_files = find_tif_files(input_folder)
-    numbered_files, skipped_files = validate_and_sort_files(raw_files, log_lines)
+    files = [
+        file for file in input_folder.iterdir()
+        if file.is_file() and file.suffix.lower() in [".tif", ".tiff"]
+    ]
+
+    numbered_files = []
+    skipped = []
+
+    for file in files:
+        seq = extract_sequence_number(file.name)
+
+        if seq is None:
+            skipped.append(file.name)
+            log(f"Skipped non-numbered filename: {file.name}", log_lines)
+        else:
+            numbered_files.append((seq, file))
+
+    numbered_files.sort(key=lambda x: x[0])
 
     if not numbered_files:
-        print("No valid TIFF files ending in _###.tif or _###.tiff were found.")
-        Path(log_file).write_text("\n".join(log_lines), encoding="utf-8")
+        print("\nERROR: No valid TIF files found.")
+        print("This script needs filenames with some kind of number, like:")
+        print("KIC Image 0001.tif")
+        print("scan-0001.tif")
+        print("page0001.tif")
+        pause_before_exit()
         sys.exit(1)
 
-    min_seq, max_seq, missing_numbers = check_sequence(numbered_files)
+    found_numbers = [seq for seq, _ in numbered_files]
+    min_seq = min(found_numbers)
+    max_seq = max(found_numbers)
 
-    first_file = numbered_files[0][1].name
-    last_file = numbered_files[-1][1].name
-    actual_count = len(numbered_files)
-    expected_count = (max_seq - min_seq) + 1
+    missing = sorted(set(range(min_seq, max_seq + 1)) - set(found_numbers))
+
+    duplicate_numbers = sorted(
+        number for number in set(found_numbers)
+        if found_numbers.count(number) > 1
+    )
 
     print("\nSummary")
     print("-" * 30)
-    print(f"Found TIFFs:       {len(raw_files)}")
-    print(f"Valid numbered:    {actual_count}")
-    print(f"Sequence range:    {min_seq:03d}-{max_seq:03d}")
-    print(f"Expected in range: {expected_count}")
-    print(f"First in order:    {first_file}")
-    print(f"Last in order:     {last_file}")
-    print(f"Skipped filenames: {len(skipped_files)}")
-    print(f"Missing numbers:   {len(missing_numbers)}")
+    print(f"Found TIFs:         {len(files)}")
+    print(f"Valid numbered:     {len(numbered_files)}")
+    print(f"Sequence range:     {min_seq:04d}-{max_seq:04d}")
+    print(f"Skipped filenames:  {len(skipped)}")
+    print(f"Missing numbers:    {len(missing)}")
+    print(f"Duplicate numbers:  {len(duplicate_numbers)}")
 
-    log(f"Input folder: {input_folder}", log_lines)
-    log(f"Output PDF: {output_pdf}", log_lines)
-    log(f"Total TIFF files discovered: {len(raw_files)}", log_lines)
-    log(f"Valid numbered TIFF files: {actual_count}", log_lines)
-    log(f"Sequence range discovered: {min_seq:03d}-{max_seq:03d}", log_lines)
-    log(f"Expected count in discovered range: {expected_count}", log_lines)
-    log(f"First file in order: {first_file}", log_lines)
-    log(f"Last file in order: {last_file}", log_lines)
-    log(f"Skipped filename count: {len(skipped_files)}", log_lines)
-    log(f"Missing number count: {len(missing_numbers)}", log_lines)
-
-    if missing_numbers:
-        preview = ", ".join(f"{n:03d}" for n in missing_numbers[:20])
-        if len(missing_numbers) > 20:
+    if missing:
+        preview = ", ".join(f"{n:04d}" for n in missing[:20])
+        if len(missing) > 20:
             preview += ", ..."
-        print(f"Missing preview:   {preview}")
-        log("Missing sequence numbers: " + ", ".join(f"{n:03d}" for n in missing_numbers), log_lines)
+        print(f"Missing preview:    {preview}")
+        log("Missing numbers: " + ", ".join(f"{n:04d}" for n in missing), log_lines)
     else:
-        print("Missing preview:   None")
-        log("No missing sequence numbers detected in discovered range.", log_lines)
+        print("Missing preview:    None")
+        log("No missing numbers detected.", log_lines)
 
-    write_manifest(manifest_file, numbered_files)
-    log(f"Manifest written to: {manifest_file}", log_lines)
+    if duplicate_numbers:
+        preview = ", ".join(f"{n:04d}" for n in duplicate_numbers[:20])
+        if len(duplicate_numbers) > 20:
+            preview += ", ..."
+        print(f"Duplicate preview:  {preview}")
+        log("Duplicate numbers: " + ", ".join(f"{n:04d}" for n in duplicate_numbers), log_lines)
 
-    print("\nCreating PDF...")
-    processed_count = build_pdf(numbered_files, output_pdf, log_lines)
+        print("\nWARNING: Duplicate sequence numbers were found.")
+        print("The PDF can still be created, but you may want to check these first.")
+
+    with manifest_file.open("w", encoding="utf-8") as f:
+        f.write("sequence_number\tfilename\n")
+        for seq, path in numbered_files:
+            f.write(f"{seq:04d}\t{path.name}\n")
+
+    pdf_images = []
+
+    print("\nPreparing PDF...")
+
+    for seq, path in tqdm(numbered_files, desc="Checking files", unit="file", ncols=90):
+        try:
+            image = Image.open(path)
+
+            # If the TIF has multiple frames/pages, use the first frame.
+            image.seek(0)
+
+            # PDF output needs RGB images.
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+
+            pdf_images.append(image.copy())
+            image.close()
+
+            log(f"Included {seq:04d}: {path.name}", log_lines)
+
+        except Exception as e:
+            skipped.append(path.name)
+            log(f"ERROR reading {path.name}: {e}", log_lines)
+            print(f"\nWARNING: Could not read {path.name}. It will be skipped.")
+
+    if not pdf_images:
+        print("\nERROR: No readable TIF files could be added to the PDF.")
+        Path(log_file).write_text("\n".join(log_lines), encoding="utf-8")
+        pause_before_exit()
+        sys.exit(1)
+
+    print("\nWriting PDF...")
+
+    first_image = pdf_images[0]
+    remaining_images = pdf_images[1:]
+
+    first_image.save(
+        output_pdf,
+        "PDF",
+        resolution=300.0,
+        save_all=True,
+        append_images=remaining_images
+    )
+
+    log(f"Output PDF written to: {output_pdf}", log_lines)
+    log(f"Total TIFs included: {len(pdf_images)}", log_lines)
+
+    Path(log_file).write_text("\n".join(log_lines), encoding="utf-8")
 
     print("\nResults")
     print("-" * 30)
-    print(f"Pages processed:   {processed_count}")
-    print(f"Output PDF:        {output_pdf}")
-    print(f"Log file:          {log_file}")
-    print(f"Manifest file:     {manifest_file}")
-
-    log(f"Pages successfully processed: {processed_count}", log_lines)
-    log(f"Output PDF written to: {output_pdf}", log_lines)
-
-    if processed_count != actual_count:
-        print("Status:            WARNING - processed count does not match valid file count")
-        log("WARNING: Processed count does not match valid numbered file count.", log_lines)
-    else:
-        print("Status:            OK - processed count matches valid file count")
-        log("Processed count matches valid numbered file count.", log_lines)
-
-    if actual_count != expected_count:
-        log("WARNING: Valid file count does not match expected count in discovered range.", log_lines)
-
-    Path(log_file).write_text("\n".join(log_lines), encoding="utf-8")
+    print(f"TIFs included:      {len(pdf_images)}")
+    print(f"Output PDF:         {output_pdf}")
+    print(f"Log file:           {log_file}")
+    print(f"Manifest file:      {manifest_file}")
+    print("Status:             OK")
     print("\nDone.")
+
+    pause_before_exit()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        print("\nUNEXPECTED ERROR")
+        print("-" * 30)
+        traceback.print_exc()
+        pause_before_exit()
+        sys.exit(1)
